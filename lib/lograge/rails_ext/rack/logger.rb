@@ -1,6 +1,3 @@
-require 'active_support/concern'
-require 'rails/rack/logger'
-
 module Rails
   module Rack
     # Overwrites defaults of Rails::Rack::Logger that cause

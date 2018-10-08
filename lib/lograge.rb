@@ -1,4 +1,12 @@
+require 'action_pack'
+require 'active_support/core_ext/class/attribute'
+require 'active_support/core_ext/module/attribute_accessors'
+require 'active_support/core_ext/string/inflections'
+require 'active_support/log_subscriber'
+require 'request_store'
+
 require 'lograge/version'
+require 'lograge/action_controller_log_subscriber'
 require 'lograge/formatters/cee'
 require 'lograge/formatters/json'
 require 'lograge/formatters/graylog2'
@@ -9,15 +17,28 @@ require 'lograge/formatters/logstash'
 require 'lograge/formatters/ltsv'
 require 'lograge/formatters/raw'
 require 'lograge/log_subscriber'
+require 'lograge/middleware'
 require 'lograge/ordered_options'
-require 'active_support/core_ext/module/attribute_accessors'
-require 'active_support/core_ext/string/inflections'
 
 # rubocop:disable ModuleLength
 module Lograge
+  AS_NOTIFICATION = 'event.lograge'
+
   module_function
 
-  mattr_accessor :logger, :application, :ignore_tests
+  mattr_accessor :application, :ignore_tests, :logger
+
+  # Before format allows you to change the structure of the output.
+  # You've to pass in something callable
+  #
+  mattr_writer :before_format
+  self.before_format = nil
+
+  def before_format(data, payload)
+    result = nil
+    result = @@before_format.call(data, payload) if @@before_format
+    result || data
+  end
 
   # Custom options that will be appended to log line
   #
@@ -36,17 +57,12 @@ module Lograge
     end
   end
 
-  # Before format allows you to change the structure of the output.
-  # You've to pass in something callable
+  # The emitted log format
   #
-  mattr_writer :before_format
-  self.before_format = nil
-
-  def before_format(data, payload)
-    result = nil
-    result = @@before_format.call(data, payload) if @@before_format
-    result || data
-  end
+  # Currently supported formats are>
+  #  - :lograge - The custom tense lograge format
+  #  - :logstash - JSON formatted as a Logstash Event.
+  mattr_accessor :formatter
 
   # Set conditions for events that should be ignored
   #
@@ -87,33 +103,8 @@ module Lograge
   mattr_accessor :log_level
   self.log_level = :info
 
-  # The emitted log format
-  #
-  # Currently supported formats are>
-  #  - :lograge - The custom tense lograge format
-  #  - :logstash - JSON formatted as a Logstash Event.
-  mattr_accessor :formatter
-
-  def remove_existing_log_subscriptions
-    ActiveSupport::LogSubscriber.log_subscribers.each do |subscriber|
-      case subscriber
-      when ActionView::LogSubscriber
-        unsubscribe(:action_view, subscriber)
-      when ActionController::LogSubscriber
-        unsubscribe(:action_controller, subscriber)
-      end
-    end
-  end
-
-  def unsubscribe(component, subscriber)
-    events = subscriber.public_methods(false).reject { |method| method.to_s == 'call' }
-    events.each do |event|
-      ActiveSupport::Notifications.notifier.listeners_for("#{event}.#{component}").each do |listener|
-        if listener.instance_variable_get('@delegate') == subscriber
-          ActiveSupport::Notifications.unsubscribe listener
-        end
-      end
-    end
+  def lograge_config
+    application.config.lograge
   end
 
   def setup(app)
@@ -127,6 +118,53 @@ module Lograge
     support_deprecated_config # TODO: Remove with version 1.0
     set_formatter
     set_ignores
+    setup_subscriber
+  end
+
+  # Internal API
+
+  def attach_to_action_controller
+    Lograge::ActionControllerLogSubscriber.attach_to :action_controller
+  end
+
+  def disable_rack_cache_verbose_output
+    application.config.action_dispatch.rack_cache[:verbose] = false if rack_cache_hashlike?(application)
+  end
+
+  def extend_base_controller_class(klass)
+    append_payload_method = klass.instance_method(:append_info_to_payload)
+    custom_payload_method = lograge_config.custom_payload_method
+
+    klass.send(:define_method, :append_info_to_payload) do |payload|
+      append_payload_method.bind(self).call(payload)
+      payload[:custom_payload] = custom_payload_method.call(self)
+    end
+  end
+
+  def keep_original_rails_log
+    return if lograge_config.keep_original_rails_log
+
+    require 'lograge/rails_ext/rack/logger'
+    Lograge.remove_existing_log_subscriptions
+  end
+
+  def rack_cache_hashlike?(app)
+    app.config.action_dispatch.rack_cache && app.config.action_dispatch.rack_cache.respond_to?(:[]=)
+  end
+
+  def remove_existing_log_subscriptions
+    ActiveSupport::LogSubscriber.log_subscribers.each do |subscriber|
+      case subscriber
+      when ActionView::LogSubscriber
+        unsubscribe(:action_view, subscriber)
+      when ActionController::LogSubscriber
+        unsubscribe(:action_controller, subscriber)
+      end
+    end
+  end
+
+  def set_formatter
+    Lograge.formatter = lograge_config.formatter || Lograge::Formatters::KeyValue.new
   end
 
   def set_ignores
@@ -134,12 +172,11 @@ module Lograge
     Lograge.ignore(lograge_config.ignore_custom)
   end
 
-  def set_formatter
-    Lograge.formatter = lograge_config.formatter || Lograge::Formatters::KeyValue.new
-  end
-
-  def attach_to_action_controller
-    Lograge::RequestLogSubscriber.attach_to :action_controller
+  def set_lograge_log_options
+    Lograge.before_format = lograge_config.before_format
+    Lograge.custom_options = lograge_config.custom_options
+    Lograge.log_level = lograge_config.log_level || :info
+    Lograge.logger = lograge_config.logger
   end
 
   def setup_custom_payload
@@ -156,41 +193,11 @@ module Lograge
     end
   end
 
-  def extend_base_controller_class(klass)
-    append_payload_method = klass.instance_method(:append_info_to_payload)
-    custom_payload_method = lograge_config.custom_payload_method
-
-    klass.send(:define_method, :append_info_to_payload) do |payload|
-      append_payload_method.bind(self).call(payload)
-      payload[:custom_payload] = custom_payload_method.call(self)
-    end
+  def setup_subscriber
+    Lograge::LogSubscriber.attach_to :lograge
   end
-
-  def set_lograge_log_options
-    Lograge.logger = lograge_config.logger
-    Lograge.custom_options = lograge_config.custom_options
-    Lograge.before_format = lograge_config.before_format
-    Lograge.log_level = lograge_config.log_level || :info
-  end
-
-  def disable_rack_cache_verbose_output
-    application.config.action_dispatch.rack_cache[:verbose] = false if rack_cache_hashlike?(application)
-  end
-
-  def keep_original_rails_log
-    return if lograge_config.keep_original_rails_log
-
-    require 'lograge/rails_ext/rack/logger'
-    Lograge.remove_existing_log_subscriptions
-  end
-
-  def rack_cache_hashlike?(app)
-    app.config.action_dispatch.rack_cache && app.config.action_dispatch.rack_cache.respond_to?(:[]=)
-  end
-  private_class_method :rack_cache_hashlike?
 
   # TODO: Remove with version 1.0
-
   def support_deprecated_config
     return unless lograge_config.log_format
 
@@ -201,8 +208,15 @@ module Lograge
     lograge_config.formatter = "Lograge::Formatters::#{legacy_log_format.to_s.classify}".constantize.new
   end
 
-  def lograge_config
-    application.config.lograge
+  def unsubscribe(component, subscriber)
+    events = subscriber.public_methods(false).reject { |method| method.to_s == 'call' }
+    events.each do |event|
+      ActiveSupport::Notifications.notifier.listeners_for("#{event}.#{component}").each do |listener|
+        if listener.instance_variable_get('@delegate') == subscriber
+          ActiveSupport::Notifications.unsubscribe listener
+        end
+      end
+    end
   end
 end
 
